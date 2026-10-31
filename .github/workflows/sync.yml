@@ -1,0 +1,110 @@
+name: Sync Upstream Code & Releases
+
+on:
+  schedule:
+    # 每天 UTC 时间 00:00（北京时间早上 08:00）自动运行
+    - cron: '0 0 * * *'
+  # 支持在 Actions 页面手动点击触发测试
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GH_PAT }}
+
+      - name: 同步源码与 Git Tags（保留 sync.yml）
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # 1. 备份 sync.yml 到临时目录
+          mkdir -p /tmp/sync_backup
+          cp .github/workflows/sync.yml /tmp/sync_backup/sync.yml
+
+          # 2. 拉取上游仓库
+          git remote add upstream https://github.com/3899/SimAdmin.git
+          git fetch upstream --tags
+
+          # 自动获取上游主分支名称
+          DEFAULT_BRANCH=$(git remote show upstream | grep 'HEAD branch' | cut -d' ' -f5)
+
+          # 3. 强制重置本地代码到上游最新状态
+          git checkout $DEFAULT_BRANCH || git checkout -b $DEFAULT_BRANCH
+          git reset --hard upstream/$DEFAULT_BRANCH
+
+          # 4. 还原 sync.yml 并提交
+          mkdir -p .github/workflows
+          cp /tmp/sync_backup/sync.yml .github/workflows/sync.yml
+          git add .github/workflows/sync.yml
+          git commit -m "ci: preserve sync workflow file" || true
+          
+          # 5. 推送到你的 Fork 仓库
+          git push https://x-access-token:${{ secrets.GH_PAT }}@github.com/${{ github.repository }}.git $DEFAULT_BRANCH --force --tags
+
+      - name: 检查并同步 Releases 与产物附件
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+          UPSTREAM_REPO: "3899/SimAdmin"
+          MY_REPO: ${{ github.repository }}
+        run: |
+          # 1. 通过 API 精确获取上游最新 Release 的 Tag 名称（确保获取的是 v1.1.8 而不是标题）
+          UPSTREAM_RELEASE=$(gh api repos/$UPSTREAM_REPO/releases/latest --jq '.tag_name' 2>/dev/null || true)
+
+          if [ -z "$UPSTREAM_RELEASE" ]; then
+            echo "上游仓库尚未发布任何 Release，跳过。"
+            exit 0
+          fi
+
+          echo "成功解析上游最新 Tag: $UPSTREAM_RELEASE"
+
+          # 2. 检查 Fork 仓库中的 Release 附件数量
+          MY_ASSETS_COUNT=$(gh release view "$UPSTREAM_RELEASE" -R "$MY_REPO" --json assets --jq '.assets | length' 2>/dev/null || echo "-1")
+
+          # 如果附件数量大于 0，说明已经完整同步过附件了
+          if [ "$MY_ASSETS_COUNT" -gt 0 ]; then
+            echo "当前 Release ($UPSTREAM_RELEASE) 在 Fork 仓库中已完整存在（包含附件），跳过同步。"
+            exit 0
+          fi
+
+          echo "检测到 Release $UPSTREAM_RELEASE 缺失产物附件（目前附件数: $MY_ASSETS_COUNT），开始补充同步..."
+
+          # 3. 解析上游 Release 元数据
+          RELEASE_INFO=$(gh api repos/$UPSTREAM_REPO/releases/tags/$UPSTREAM_RELEASE)
+          RELEASE_TITLE=$(echo "$RELEASE_INFO" | jq -r '.name // .tag_name')
+          RELEASE_BODY=$(echo "$RELEASE_INFO" | jq -r '.body // ""')
+          IS_PRERELEASE=$(echo "$RELEASE_INFO" | jq -r '.prerelease')
+
+          # 4. 下载上游 Release 附件
+          rm -rf assets
+          mkdir -p assets
+          cd assets
+          gh release download "$UPSTREAM_RELEASE" -R "$UPSTREAM_REPO" --pattern "*" || true
+          cd ..
+
+          FLAGS=()
+          if [ "$IS_PRERELEASE" == "true" ]; then
+            FLAGS+=("--prerelease")
+          fi
+
+          # 5. 如果已经有了空壳 Release，先清理旧壳
+          if [ "$MY_ASSETS_COUNT" -eq 0 ]; then
+            echo "清理无附件的 Release 记录..."
+            gh release delete "$UPSTREAM_RELEASE" -R "$MY_REPO" --yes || true
+          fi
+
+          # 6. 重新创建完整的 Release 并上传二进制附件
+          if [ -d "assets" ] && [ "$(ls -A assets 2>/dev/null)" ]; then
+            gh release create "$UPSTREAM_RELEASE" assets/* -R "$MY_REPO" --title "$RELEASE_TITLE" --notes "$RELEASE_BODY" "${FLAGS[@]}"
+          else
+            gh release create "$UPSTREAM_RELEASE" -R "$MY_REPO" --title "$RELEASE_TITLE" --notes "$RELEASE_BODY" "${FLAGS[@]}"
+          fi
+
+          echo "Release $UPSTREAM_RELEASE 及编译产物已成功同步到你的 Fork！"
